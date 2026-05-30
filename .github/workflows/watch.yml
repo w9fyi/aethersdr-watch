@@ -1,0 +1,97 @@
+name: Watch AetherSDR accessibility
+
+on:
+  schedule:
+    - cron: '7 */4 * * *'   # every 4 hours at :07
+  workflow_dispatch:          # manual trigger for testing
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Watch upstream issues
+        id: watch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p state
+
+          # Load previous state (default 0 if first run)
+          LAST_ISSUE_ID=$(jq -r '.issue_3288_last_comment_id // 0' state/aethersdr_a11y.json 2>/dev/null || echo 0)
+          LAST_PR_ID=$(jq -r '.pr_3289_last_comment_id // 0' state/aethersdr_a11y.json 2>/dev/null || echo 0)
+          echo "State: issue last=$LAST_ISSUE_ID  PR last=$LAST_PR_ID"
+
+          # Fetch from public upstream repo — no extra token needed
+          ISSUE_COMMENTS=$(gh api repos/aethersdr/AetherSDR/issues/3288/comments --paginate 2>/dev/null || echo '[]')
+          PR_COMMENTS=$(gh api repos/aethersdr/AetherSDR/issues/3289/comments --paginate 2>/dev/null || echo '[]')
+
+          # New human comments only (filter bots and our own account)
+          NEW_ISSUE=$(echo "$ISSUE_COMMENTS" | jq --argjson last "$LAST_ISSUE_ID" \
+            '[.[] | select(.id > $last) | select(.user.type != "Bot") | select(.user.login != "w9fyi")]')
+          NEW_PR=$(echo "$PR_COMMENTS" | jq --argjson last "$LAST_PR_ID" \
+            '[.[] | select(.id > $last) | select(.user.type != "Bot") | select(.user.login != "w9fyi")]')
+
+          ISSUE_COUNT=$(echo "$NEW_ISSUE" | jq 'length')
+          PR_COUNT=$(echo "$NEW_PR" | jq 'length')
+          echo "New human comments: issue=$ISSUE_COUNT  PR=$PR_COUNT"
+
+          # Update state to latest seen IDs
+          NEW_ISSUE_MAX=$(echo "$ISSUE_COMMENTS" | jq --argjson last "$LAST_ISSUE_ID" '[.[].id] | if length > 0 then max else $last end')
+          NEW_PR_MAX=$(echo "$PR_COMMENTS" | jq --argjson last "$LAST_PR_ID" '[.[].id] | if length > 0 then max else $last end')
+          jq -n --argjson i "$NEW_ISSUE_MAX" --argjson p "$NEW_PR_MAX" \
+            '{issue_3288_last_comment_id: $i, pr_3289_last_comment_id: $p}' > state/aethersdr_a11y.json
+
+          if [ "$ISSUE_COUNT" -gt 0 ] || [ "$PR_COUNT" -gt 0 ]; then
+            echo "human_found=true" >> "$GITHUB_OUTPUT"
+
+            # Write notification body to a file (avoids multiline output escaping)
+            {
+              echo "## Human response on AetherSDR accessibility work"
+              echo ""
+              if [ "$ISSUE_COUNT" -gt 0 ]; then
+                echo "### Issue [#3288](https://github.com/aethersdr/AetherSDR/issues/3288) — Phase 2 accessibility"
+                echo ""
+                echo "$NEW_ISSUE" | jq -r '.[] |
+                  "**@\(.user.login)** at \(.created_at):\n\n> \(.body | split("\n")[0:5] | join("\n> "))\n\n[View comment](\(.html_url))\n"'
+              fi
+              if [ "$PR_COUNT" -gt 0 ]; then
+                echo "### PR [#3289](https://github.com/aethersdr/AetherSDR/pull/3289) — Accessibility CI tooling"
+                echo ""
+                echo "$NEW_PR" | jq -r '.[] |
+                  "**@\(.user.login)** at \(.created_at):\n\n> \(.body | split("\n")[0:5] | join("\n> "))\n\n[View comment](\(.html_url))\n"'
+              fi
+            } > /tmp/notify_body.md
+
+            echo "--- notification body ---"
+            cat /tmp/notify_body.md
+          else
+            echo "human_found=false" >> "$GITHUB_OUTPUT"
+            echo "No new human comments — nothing to do."
+          fi
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/aethersdr_a11y.json
+          if git diff --cached --quiet; then
+            echo "State unchanged — no commit needed"
+          else
+            git commit -m "chore: update watch state"
+            git push
+          fi
+
+      - name: Open notification issue
+        if: steps.watch.outputs.human_found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Human response on AetherSDR accessibility" \
+            --body-file /tmp/notify_body.md
